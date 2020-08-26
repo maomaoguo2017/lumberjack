@@ -77,6 +77,9 @@ var _ io.WriteCloser = (*Logger)(nil)
 //
 // If MaxBackups and MaxAge are both 0, no old log files will be deleted.
 type Logger struct {
+	RollType   string `json:"rolltype" yaml:"rolltype"`
+	BIFilePath string `json:"bifilepath" yaml:"bifilepath"`
+
 	// Filename is the file to write logs to.  Backup log files will be retained
 	// in the same directory.  It uses <processname>-lumberjack.log in
 	// os.TempDir() if empty.
@@ -107,6 +110,8 @@ type Logger struct {
 	// using gzip. The default is not to perform compression.
 	Compress bool `json:"compress" yaml:"compress"`
 
+	currentDateStr string
+	// currentDate
 	size int64
 	file *os.File
 	mu   sync.Mutex
@@ -135,30 +140,107 @@ var (
 func (l *Logger) Write(p []byte) (n int, err error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	writeLen := int64(len(p))
-	if writeLen > l.max() {
-		return 0, fmt.Errorf(
-			"write length %d exceeds maximum file size %d", writeLen, l.max(),
-		)
-	}
-
-	if l.file == nil {
-		if err = l.openExistingOrNew(len(p)); err != nil {
-			return 0, err
+	if l.RollType == "local" {
+		writeLen := int64(len(p))
+		if writeLen > l.max() {
+			return 0, fmt.Errorf(
+				"write length %d exceeds maximum file size %d", writeLen, l.max(),
+			)
 		}
-	}
 
-	if l.size+writeLen > l.max() {
-		if err := l.rotate(); err != nil {
-			return 0, err
+		if l.file == nil {
+			if err = l.openExistingOrNew(len(p)); err != nil {
+				return 0, err
+			}
 		}
+
+		if l.size+writeLen > l.max() {
+			if err := l.rotate(); err != nil {
+				return 0, err
+			}
+		}
+
+		n, err = l.file.Write(p)
+		l.size += int64(n)
+
+	} else if l.RollType == "bi" {
+		if l.isChangeDate() {
+			l.updateCurrentTime()
+			if err := l.birotate(); err != nil {
+				return 0, err
+			}
+		}
+
+		if l.file == nil {
+			if err = l.openBIExistingOrNew(len(p)); err != nil {
+				return 0, err
+			}
+		}
+		n, err = l.file.Write(p)
 	}
-
-	n, err = l.file.Write(p)
-	l.size += int64(n)
-
 	return n, err
+}
+func (l *Logger) birotate() error {
+	if err := l.close(); err != nil {
+		return err
+	}
+	if err := l.openBINew(); err != nil {
+		return err
+	}
+	return nil
+}
+func (l *Logger) bidir() string {
+	return l.BIFilePath + "/" + l.currentDateStr
+}
+func (l *Logger) openBINew() error {
+	err := os.MkdirAll(l.bidir(), 0755)
+	if err != nil {
+		return fmt.Errorf("can't make directories for new logfile: %s", err)
+	}
+
+	name := l.bifilename()
+	mode := os.FileMode(0600)
+
+	// we use truncate here because this should only get called when we've moved
+	// the file ourselves. if someone else creates the file in the meantime,
+	// just wipe out the contents.
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return fmt.Errorf("can't open new logfile: %s", err)
+	}
+	l.file = f
+	l.size = 0
+	return nil
+}
+func (l *Logger) bifilename() string {
+	return fmt.Sprintf("%s/%s/%s-%d", l.BIFilePath, l.currentDateStr, l.currentDateStr, os.Getpid())
+}
+func (l *Logger) openBIExistingOrNew(writeLen int) error {
+
+	filename := l.bifilename()
+	_, err := os_Stat(filename)
+	if os.IsNotExist(err) {
+		return l.openBINew()
+	}
+	if err != nil {
+		return fmt.Errorf("error getting log file info: %s", err)
+	}
+
+	file, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		// if we fail to open the old log file for some reason, just ignore
+		// it and open a new log file.
+		return l.openBINew()
+	}
+	l.file = file
+	// l.size = info.Size()
+	return nil
+}
+func (l *Logger) isChangeDate() bool {
+	return time.Now().UTC().Format("20060102") != l.currentDateStr
+}
+func (l *Logger) updateCurrentTime() {
+	l.currentDateStr = time.Now().UTC().Format("20060102")
 }
 
 // Close implements io.Closer, and closes the current logfile.
